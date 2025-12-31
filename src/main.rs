@@ -17,12 +17,11 @@ use panic_probe as _;
 // Provide an alias for our BSP so we can switch targets quickly.
 // Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
 use rp_pico as bsp;
-// use sparkfun_pro_micro_rp2040 as bsp;
 
 use bsp::hal::{
     clocks::{init_clocks_and_plls, Clock},
-    gpio::{bank0, FunctionPwm, FunctionSio, Pin, PullDown, SioInput, SioOutput},
-    i2c::I2C,
+    gpio::{bank0, FunctionI2C, FunctionPwm, FunctionSio, Pin, PullDown, PullUp, SioInput, SioOutput},
+    i2c::{Controller, I2C},
     pac,
     pwm::Slices,
     sio::Sio,
@@ -44,6 +43,15 @@ const VELOCITY_OF_SOUND: u64 = 340;
 // タイムアウト時間（最大待機時間） 10000 = 0.01(m) * 1_000_000(usec)
 const ULTRASONIC_TIMEOUT_USEC: u64 = (2 * 10000 * MAX_DISTANCE_CM) / VELOCITY_OF_SOUND;
 
+type I2cPins = (
+    Pin<bank0::Gpio4, FunctionI2C, PullUp>,
+    Pin<bank0::Gpio5, FunctionI2C, PullUp>,
+);
+type I2cBus = I2C<pac::I2C0, I2cPins, Controller>;
+
+//================================================
+//  Main
+//================================================
 #[entry]
 fn main() -> ! {
     let mut pac = pac::Peripherals::take().unwrap();
@@ -72,23 +80,10 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
-    let mut app = ParkingApp::new(
-        bsp::hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS), // PWM sliceの作成
-        cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz()),
-        pins.gpio16.into_pull_down_input(),
-        pins.gpio18.into_pull_down_input(),
-        pins.gpio19.into_push_pull_output(),
-    );
-
-    // for Ultrasonic Sensor
-    // TRIG/ECHOピンを初期化
-    //let mut trig_pin = pins.gpio19.into_push_pull_output();
-    //let mut echo_pin = pins.gpio18.into_pull_down_input();
-    //let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
-
-    // for LCD
     // Timer implements embedded-hal 1.0 DelayNs in rp2040-hal 0.10
     let timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
+
+    let lcd_delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
     // I2C0 on GP4(SDA) / GP5(SCL)
     let sda = pins
@@ -108,51 +103,32 @@ fn main() -> ! {
         &mut pac.RESETS,
         clocks.peripheral_clock.freq(),
     );
-    // よくあるアドレス: 0x27 or 0x3F（違ったらここを変える）
-    let addr = 0x27;
 
-    // Typical backpack mapping:
-    // P0=RS, P1=RW, P2=E, P3=BL, P4..P7=D4..D7
-    let encoder = Pcf8574EncoderDefault::new();
-    let interface = Pcf8574Interface::new(i2c, addr, timer, encoder);
-
-    // 16 columns x 2 lines, 5x8 font
-    let mut lcd = Hd44780::new(interface, DisplayTypeFont5x8::new(2, 16, FnsetLines::Two));
-
-    lcd.init().unwrap();
-    lcd.clear().unwrap();
-    lcd.print_str("Hello, Pico!").unwrap();
-    lcd.position(1, 0).unwrap();
-    lcd.print_str("PCF8574T LCD").unwrap();
+    let mut app = ParkingApp::new(
+        bsp::hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS), // PWM sliceの作成
+        i2c,
+        lcd_delay,
+        pins.gpio16.into_pull_down_input(),
+        pins.gpio18.into_pull_down_input(),
+        pins.gpio19.into_push_pull_output(),
+    );
 
     // push button
     let mut button_pin = pins.gpio15.into_pull_up_input();
 
-    // This is the correct pin on the Raspberry Pico board. On other boards, even if they have an
-    // on-board LED, it might need to be changed.
-    //
-    // Notably, on the Pico W, the LED is not connected to any of the RP2040 GPIOs but to the cyw43 module instead.
-    // One way to do that is by using [embassy](https://github.com/embassy-rs/embassy/blob/main/examples/rp/src/bin/wifi_blinky.rs)
-    //
-    // If you have a Pico W and want to toggle a LED with a simple GPIO output pin, you can connect an external
-    // LED to one of the GPIO pins, and reference that pin here. Don't forget adding an appropriate resistor
-    // in series with the LED.
+    // on-board LED
     let mut led_pin = pins.led.into_push_pull_output();
 
-    let mut mean_distance: u64 = 0;
     let mut periodic_5ms: u64 = 0;
     let mut periodic_200ms: u64 = 0;
 
     loop {
         let distance = app.sensor.detect_distance(&timer);
 
-        // 平均距離を指数移動平均で更新
-        mean_distance = (95 * mean_distance + 5 * distance) / 100;
-
         let crnt_time = timer.get_counter().ticks();
         if crnt_time - periodic_5ms > 5000 {
-            app.svc
-                .periodic(button_pin.is_low().ok().unwrap(), mean_distance);
+            let open = button_pin.is_low().ok().unwrap() | app.sensor.is_open(); 
+            app.svc.periodic(open);
             periodic_5ms = crnt_time;
         }
 
@@ -166,39 +142,8 @@ fn main() -> ! {
             periodic_200ms = crnt_time;
         }
 
-        let mut buf = [32u8; 16];
-        let cnt_str = i16_to_str(mean_distance as i16, &mut buf);
-        lcd.position(1, 0).unwrap();
-        lcd.print_str(cnt_str).unwrap();
+        app.display.display_distance(distance);
     }
-}
-fn i16_to_str(n: i16, out: &mut [u8; 16]) -> &str {
-    // Max length of i16 is "-32768" (6 bytes)
-    let mut i = out.len();
-
-    let mut v: i32 = n as i32;
-    let negative = v < 0;
-    if negative {
-        v = -v; // safe in i32 even for i16::MIN
-    }
-
-    // write at least one digit
-    loop {
-        let digit = (v % 10) as u8;
-        v /= 10;
-        i -= 1;
-        out[i] = b'0' + digit;
-        if v == 0 {
-            break;
-        }
-    }
-
-    if negative {
-        i -= 1;
-        out[i] = b'-';
-    }
-
-    core::str::from_utf8(&out[0..]).unwrap()
 }
 
 //================================================
@@ -207,18 +152,21 @@ fn i16_to_str(n: i16, out: &mut [u8; 16]) -> &str {
 struct ParkingApp {
     pub svc: ServoController,
     pub sensor: SuperSonicSensor,
+    pub display: DisplayController,
 }
 impl ParkingApp {
     fn new(
         pwm_slices: Slices,
-        delay: cortex_m::delay::Delay,
+        i2c: I2cBus,
+        lcd_delay: cortex_m::delay::Delay,
         pin16: Pin<bank0::Gpio16, FunctionSio<SioInput>, PullDown>,
         pin18: Pin<bank0::Gpio18, FunctionSio<SioInput>, PullDown>,
         pin19: Pin<bank0::Gpio19, FunctionSio<SioOutput>, PullDown>,
     ) -> Self {
         ParkingApp {
             svc: ServoController::new(pwm_slices, pin16),
-            sensor: SuperSonicSensor::new(delay, pin18, pin19),
+            sensor: SuperSonicSensor::new(pin18, pin19),
+            display: DisplayController::new(i2c, lcd_delay),
         }
     }
 }
@@ -230,7 +178,7 @@ struct ServoController {
         bsp::hal::pwm::Slice<bsp::hal::pwm::Pwm0, bsp::hal::pwm::FreeRunning>,
         bsp::hal::pwm::A,
     >,
-    pressed: bool,
+    open_state: bool,
     last_duty: i64,
 }
 impl ServoController {
@@ -263,25 +211,19 @@ impl ServoController {
         ServoController {
             duty_max: channel_a.get_max_duty() as i64,
             pwm_channel: channel_a,
-            pressed: false,
+            open_state: false,
             last_duty: 0,
         }
     }
-    fn periodic(&mut self, button_pressed: bool, distance: u64) {
-        // 距離をサーボのデューティにマッピング（50mm..500mm → 5%..10%）
-        let servo_min = self.duty_max * 5 / 100;
-        let servo_max = self.duty_max * 10 / 100;
-        let mm = (distance.clamp(50, 500) - 50) as i64;
-        let _duty = servo_min + (mm * (servo_max - servo_min)) / (500 - 50);
-        //pwm_channel.set_duty(duty as u16);
-        if !self.pressed && button_pressed {
-            self.pressed = true;
-        } else if self.pressed && !button_pressed {
-            self.pressed = false;
+    fn periodic(&mut self, open: bool) { // 5ms周期で呼び出される
+        if !self.open_state && open {
+            self.open_state = true;
+        } else if self.open_state && !open {
+            self.open_state = false;
         }
-        if self.pressed {
+        if !self.open_state {
             self.last_duty += 20;
-            if self.last_duty > (self.duty_max / 27) {
+            if self.last_duty > (self.duty_max / 27) { // 90度相当
                 self.last_duty = self.duty_max / 27;
             }
         } else {
@@ -295,28 +237,31 @@ impl ServoController {
 }
 //================================================
 struct SuperSonicSensor {
-    delay: cortex_m::delay::Delay,
     trig_pin: Pin<bank0::Gpio19, FunctionSio<SioOutput>, PullDown>,
     echo_pin: Pin<bank0::Gpio18, FunctionSio<SioInput>, PullDown>,
+    distance: u64,
 }
 impl SuperSonicSensor {
     fn new(
-        delay: cortex_m::delay::Delay,
         pin18: Pin<bank0::Gpio18, FunctionSio<SioInput>, PullDown>,
         pin19: Pin<bank0::Gpio19, FunctionSio<SioOutput>, PullDown>,
     ) -> Self {
         SuperSonicSensor {
-            delay,
             trig_pin: pin19,
             echo_pin: pin18,
+            distance: 0,
         }
+    }
+    fn delay_us(timer: &Timer, us: u64) {
+        let start = timer.get_counter().ticks();
+        while timer.get_counter().ticks().wrapping_sub(start) < us {}
     }
     fn detect_distance(&mut self, timer: &Timer) -> u64 {
         // トリガーから10マイクロ秒のパルスをぶちこむ
         self.trig_pin.set_low().unwrap();
-        self.delay.delay_us(2);
+        Self::delay_us(timer, 2);
         self.trig_pin.set_high().unwrap();
-        self.delay.delay_us(10);
+        Self::delay_us(timer, 10);
         self.trig_pin.set_low().unwrap();
 
         // 超音波が発射されたときのクロックティックを取得（発射されるまでlowを維持）
@@ -338,7 +283,84 @@ impl SuperSonicSensor {
         }
 
         // 超音波が発射されて帰ってくるまでの経過時間から距離を算出（mm）
-        ((high_time - low_time) * VELOCITY_OF_SOUND) / (2 * 1000)
+        let raw_distance = ((high_time - low_time) * VELOCITY_OF_SOUND) / (2 * 1000);
+
+        // 平均距離を指数移動平均で更新
+        self.distance = (95 * self.distance + 5 * raw_distance) / 100;
+
+        self.distance
+    }
+    fn is_open(&mut self) -> bool {
+        self.distance < 100
+    }
+}
+//================================================
+struct LcdDelay {
+    inner: cortex_m::delay::Delay,
+}
+impl embedded_hal::delay::DelayNs for LcdDelay {
+    fn delay_ns(&mut self, ns: u32) {
+        let us = (ns + 999) / 1_000;
+        if us > 0 {
+            self.inner.delay_us(us);
+        }
+    }
+}
+//================================================
+type LcdInterface = Pcf8574Interface<I2cBus, LcdDelay, Pcf8574EncoderDefault>;
+type Lcd = Hd44780<LcdInterface, DisplayTypeFont5x8>;
+
+struct DisplayController {
+    lcd: Lcd,
+}
+impl DisplayController {
+    fn new(i2c: I2cBus, delay: cortex_m::delay::Delay) -> Self {
+        let addr = 0x27;
+        // Typical backpack mapping:
+        // P0=RS, P1=RW, P2=E, P3=BL, P4..P7=D4..D7
+        let encoder = Pcf8574EncoderDefault::new();
+        let delay = LcdDelay { inner: delay };
+        let interface = Pcf8574Interface::new(i2c, addr, delay, encoder);
+        let mut lcd = Hd44780::new(interface, DisplayTypeFont5x8::new(2, 16, FnsetLines::Two)); // 16 columns x 2 lines, 5x8 font
+        lcd.init().unwrap();
+        lcd.clear().unwrap();
+        DisplayController { lcd }
+    }
+    fn display_distance(&mut self, distance: u64) {
+        self.lcd.position(0, 0).unwrap();
+        self.lcd.print_str("Dist.:  ").unwrap();
+        let mut buf = [32u8; 6];
+        let cnt_str = Self::i16_to_str(distance as i16, &mut buf);
+        self.lcd.print_str(cnt_str).unwrap();
+        self.lcd.print_str("mm").unwrap();
+    }
+    fn i16_to_str(n: i16, out: &mut [u8; 6]) -> &str {
+        // Max length of i16 is "-32768" (6 bytes)
+        let mut i = out.len();
+
+        let mut v: i32 = n as i32;
+        let negative = v < 0;
+        if negative {
+            v = -v; // safe in i32 even for i16::MIN
+        }
+
+        // write at least one digit
+        loop {
+            let digit = (v % 10) as u8;
+            v /= 10;
+            i -= 1;
+            out[i] = b'0' + digit;
+            if v == 0 {
+                break;
+            }
+        }
+
+        if negative {
+            i -= 1;
+            out[i] = b'-';
+        }
+
+        core::str::from_utf8(out).unwrap()
     }
 }
 // End of file
