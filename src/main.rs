@@ -20,7 +20,9 @@ use rp_pico as bsp;
 
 use bsp::hal::{
     clocks::{init_clocks_and_plls, Clock},
-    gpio::{bank0, FunctionI2C, FunctionPwm, FunctionSio, Pin, PullDown, PullUp, SioInput, SioOutput},
+    gpio::{
+        bank0, FunctionI2C, FunctionPwm, FunctionSio, Pin, PullDown, PullUp, SioInput, SioOutput,
+    },
     i2c::{Controller, I2C},
     pac,
     pwm::Slices,
@@ -127,7 +129,7 @@ fn main() -> ! {
 
         let crnt_time = timer.get_counter().ticks();
         if crnt_time - periodic_5ms > 5000 {
-            let open = button_pin.is_low().ok().unwrap() | app.sensor.is_open(); 
+            let open = button_pin.is_low().ok().unwrap() | app.sensor.is_open();
             app.svc.periodic(open);
             periodic_5ms = crnt_time;
         }
@@ -215,7 +217,8 @@ impl ServoController {
             last_duty: 0,
         }
     }
-    fn periodic(&mut self, open: bool) { // 5ms周期で呼び出される
+    fn periodic(&mut self, open: bool) {
+        // 5ms周期で呼び出される
         if !self.open_state && open {
             self.open_state = true;
         } else if self.open_state && !open {
@@ -223,7 +226,8 @@ impl ServoController {
         }
         if !self.open_state {
             self.last_duty += 20;
-            if self.last_duty > (self.duty_max / 27) { // 90度相当
+            if self.last_duty > (self.duty_max / 27) {
+                // 90度相当
                 self.last_duty = self.duty_max / 27;
             }
         } else {
@@ -300,7 +304,7 @@ struct LcdDelay {
 }
 impl embedded_hal::delay::DelayNs for LcdDelay {
     fn delay_ns(&mut self, ns: u32) {
-        let us = (ns + 999) / 1_000;
+        let us = ns.div_ceil(1_000); //(ns + 999) / 1_000;
         if us > 0 {
             self.inner.delay_us(us);
         }
